@@ -7,13 +7,19 @@
         - Imports that start with two colons (use ::a::b) - these are also silently ignored
 */
 
-use std::{collections::HashMap, fmt::Debug, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use cargo_metadata::MetadataCommand;
 use log::{debug, warn};
-use syn::{Attribute, Ident, ItemEnum, ItemStruct, UseTree};
+use syn::{Attribute, Ident, ItemEnum, ItemStruct, PathArguments, Type, UseTree};
 
-use crate::markers;
+use super::ParserResult;
+use crate::{parser::markers, utils::misc::read_rust_file};
 
 /// Represents a crate, including a map of its modules, imports, structs and
 /// enums.
@@ -26,9 +32,9 @@ pub struct Crate {
 }
 
 impl Crate {
-    pub fn new(manifest_path: &str) -> Self {
+    pub fn new(manifest_path: &str) -> ParserResult<Self> {
         let mut cmd = MetadataCommand::new();
-        cmd.manifest_path(&manifest_path);
+        cmd.manifest_path(manifest_path);
 
         let metadata = cmd.exec().unwrap();
 
@@ -50,7 +56,7 @@ impl Crate {
             } else if main_file.exists() {
                 fs::canonicalize(main_file).unwrap()
             } else {
-                panic!("No src/lib.rs or src/main.rs found for this Cargo.toml file");
+                return Err(super::Error::NoEntryPoint);
             }
         };
 
@@ -72,11 +78,11 @@ impl Crate {
 
         result.resolve();
 
-        result
+        Ok(result)
     }
 
     /// Create a map of the modules for this crate
-    pub fn resolve(&mut self) {
+    fn resolve(&mut self) {
         self.root_module.resolve();
     }
 }
@@ -85,7 +91,6 @@ impl Crate {
 #[derive(Debug, Clone)]
 pub enum Visibility {
     Public,
-    Crate,
     Restricted, // Not supported
     Inherited,  // Usually means private
 }
@@ -93,7 +98,6 @@ pub enum Visibility {
 fn syn_vis_to_visibility(vis: &syn::Visibility) -> Visibility {
     match vis {
         syn::Visibility::Public(_) => Visibility::Public,
-        syn::Visibility::Crate(_) => Visibility::Crate,
         syn::Visibility::Restricted(_) => Visibility::Restricted,
         syn::Visibility::Inherited => Visibility::Inherited,
     }
@@ -153,12 +157,19 @@ impl Debug for Enum {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TypeAlias {
+    pub ident: String,
+    pub target: Type,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModuleScope {
     pub modules: Vec<Module>,
     pub enums: Vec<Enum>,
     pub structs: Vec<Struct>,
     pub imports: Vec<Import>,
+    pub type_alias: Vec<TypeAlias>,
 }
 
 #[derive(Clone)]
@@ -183,10 +194,70 @@ impl Debug for Module {
 }
 
 /// Get a struct or enum ident, possibly remapped by a mirror marker
-fn get_ident(ident: &Ident, attrs: &[Attribute]) -> (Ident, bool) {
-    markers::extract_mirror_marker(attrs)
-        .and_then(|path| path.get_ident().map(|ident| (ident.clone(), true)))
-        .unwrap_or_else(|| (ident.clone(), false))
+fn get_ident(ident: &Ident, attrs: &[Attribute]) -> (Vec<Ident>, bool) {
+    let res = markers::extract_mirror_marker(attrs)
+        .into_iter()
+        .filter_map(|path| {
+            // eq: path.get_ident().map(Clone::clone)
+            if path.leading_colon.is_none()
+                && path.segments.len() == 1
+                && path.segments[0].arguments == PathArguments::None
+            {
+                Some(path.segments.into_iter().next().unwrap().ident)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let mirror = !res.is_empty();
+    if mirror {
+        (res, mirror)
+    } else {
+        (vec![ident.clone()], mirror)
+    }
+}
+
+fn try_get_module_file_path(
+    folder_path: &Path,
+    module_name: &str,
+    tried: &mut Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let file_path = folder_path.join(module_name).with_extension("rs");
+    if file_path.exists() {
+        return Some(file_path);
+    }
+    tried.push(file_path);
+
+    let file_path = folder_path.join(module_name).join("mod.rs");
+    if file_path.exists() {
+        return Some(file_path);
+    }
+    tried.push(file_path);
+
+    None
+}
+
+fn get_module_file_path(
+    module_name: String,
+    parent_module_file_path: &Path,
+) -> ParserResult<PathBuf, Vec<PathBuf>> {
+    let mut tried = Vec::new();
+
+    if let Some(file_path) = try_get_module_file_path(
+        parent_module_file_path.parent().unwrap(),
+        &module_name,
+        &mut tried,
+    ) {
+        return Ok(file_path);
+    }
+    if let Some(file_path) = try_get_module_file_path(
+        &parent_module_file_path.with_extension(""),
+        &module_name,
+        &mut tried,
+    ) {
+        return Ok(file_path);
+    }
+    Err(tried)
 }
 
 impl Module {
@@ -200,6 +271,7 @@ impl Module {
         let mut scope_modules = Vec::new();
         let mut scope_structs = Vec::new();
         let mut scope_enums = Vec::new();
+        let mut scope_types = Vec::new();
 
         let items = match self.source.as_ref().unwrap() {
             ModuleSource::File(file) => &file.items,
@@ -209,34 +281,50 @@ impl Module {
         for item in items.iter() {
             match item {
                 syn::Item::Struct(item_struct) => {
-                    let (ident, mirror) = get_ident(&item_struct.ident, &item_struct.attrs);
-                    let ident_str = ident.to_string();
-                    scope_structs.push(Struct {
-                        ident,
-                        src: item_struct.clone(),
-                        visibility: syn_vis_to_visibility(&item_struct.vis),
-                        path: {
-                            let mut path = self.module_path.clone();
-                            path.push(ident_str);
-                            path
-                        },
-                        mirror,
-                    });
+                    let (idents, mirror) = get_ident(&item_struct.ident, &item_struct.attrs);
+
+                    scope_structs.extend(idents.into_iter().map(|ident| {
+                        let ident_str = ident.to_string();
+                        Struct {
+                            ident,
+                            src: item_struct.clone(),
+                            visibility: syn_vis_to_visibility(&item_struct.vis),
+                            path: {
+                                let mut path = self.module_path.clone();
+                                path.push(ident_str);
+                                path
+                            },
+                            mirror,
+                        }
+                    }));
                 }
                 syn::Item::Enum(item_enum) => {
-                    let (ident, mirror) = get_ident(&item_enum.ident, &item_enum.attrs);
-                    let ident_str = ident.to_string();
-                    scope_enums.push(Enum {
-                        ident,
-                        src: item_enum.clone(),
-                        visibility: syn_vis_to_visibility(&item_enum.vis),
-                        path: {
-                            let mut path = self.module_path.clone();
-                            path.push(ident_str);
-                            path
-                        },
-                        mirror,
-                    });
+                    let (idents, mirror) = get_ident(&item_enum.ident, &item_enum.attrs);
+
+                    scope_enums.extend(idents.into_iter().map(|ident| {
+                        let ident_str = ident.to_string();
+                        Enum {
+                            ident,
+                            src: item_enum.clone(),
+                            visibility: syn_vis_to_visibility(&item_enum.vis),
+                            path: {
+                                let mut path = self.module_path.clone();
+                                path.push(ident_str);
+                                path
+                            },
+                            mirror,
+                        }
+                    }));
+                }
+                syn::Item::Type(item_type) => {
+                    if item_type.generics.where_clause.is_none()
+                        && item_type.generics.lt_token.is_none()
+                    {
+                        scope_types.push(TypeAlias {
+                            ident: item_type.ident.to_string(),
+                            target: *item_type.ty.clone(),
+                        });
+                    }
                 }
                 syn::Item::Mod(item_mod) => {
                     let ident = item_mod.ident.clone();
@@ -259,53 +347,45 @@ impl Module {
                             child_module
                         }
                         None => {
-                            let folder_path =
-                                self.file_path.parent().unwrap().join(ident.to_string());
-                            let folder_exists = folder_path.exists();
+                            let file_path =
+                                get_module_file_path(ident.to_string(), &self.file_path);
 
-                            let file_path = if folder_exists {
-                                folder_path.join("mod.rs")
-                            } else {
-                                self.file_path
-                                    .parent()
-                                    .unwrap()
-                                    .join(ident.to_string() + ".rs")
-                            };
+                            match file_path {
+                                Ok(file_path) => {
+                                    let source = {
+                                        let source_rust_content = read_rust_file(&file_path);
+                                        debug!("Trying to parse {:?}", file_path);
+                                        Some(ModuleSource::File(
+                                            syn::parse_file(&source_rust_content).unwrap(),
+                                        ))
+                                    };
+                                    let mut child_module = Module {
+                                        visibility: syn_vis_to_visibility(&item_mod.vis),
+                                        file_path,
+                                        module_path,
+                                        source,
+                                        scope: None,
+                                    };
 
-                            let file_exists = file_path.exists();
-
-                            if !file_exists {
-                                warn!(
-                                    "Skipping unresolvable module {} (tried {})",
-                                    &ident,
-                                    file_path.to_string_lossy()
-                                );
-                                continue;
+                                    child_module.resolve();
+                                    child_module
+                                }
+                                Err(tried) => {
+                                    warn!(
+                                        "Skipping unresolvable module {} (tried {})",
+                                        &ident,
+                                        tried
+                                            .into_iter()
+                                            .map(|it| it.to_string_lossy().to_string())
+                                            .fold(String::new(), |mut a, b| {
+                                                a.push_str(&b);
+                                                a.push_str(", ");
+                                                a
+                                            })
+                                    );
+                                    continue;
+                                }
                             }
-
-                            let source = if file_exists {
-                                let source_rust_content = fs::read_to_string(&file_path).unwrap();
-                                debug!("Trying to parse {:?}", file_path);
-                                Some(ModuleSource::File(
-                                    syn::parse_file(&source_rust_content).unwrap(),
-                                ))
-                            } else {
-                                None
-                            };
-
-                            let mut child_module = Module {
-                                visibility: syn_vis_to_visibility(&item_mod.vis),
-                                file_path,
-                                module_path,
-                                source,
-                                scope: None,
-                            };
-
-                            if file_exists {
-                                child_module.resolve();
-                            }
-
-                            child_module
                         }
                     });
                 }
@@ -318,6 +398,7 @@ impl Module {
             enums: scope_enums,
             structs: scope_structs,
             imports: vec![], // Will be filled in by resolve_imports()
+            type_alias: scope_types,
         });
     }
 
@@ -332,7 +413,7 @@ impl Module {
 
         for item in items.iter() {
             if let syn::Item::Use(item_use) = item {
-                let flattened_imports = flatten_use_tree(&item_use.tree);
+                let flattened_imports = flatten_use_tree(&item_use.tree).unwrap();
 
                 for import in flattened_imports {
                     imports.push(Import {
@@ -375,6 +456,21 @@ impl Module {
         self.collect_enums(&mut ans);
         ans
     }
+    pub fn collect_types(&self, container: &mut HashMap<String, Type>) {
+        let scope = self.scope.as_ref().unwrap();
+        for scope_type in &scope.type_alias {
+            container.insert(scope_type.ident.to_string(), scope_type.target.clone());
+        }
+        for scope_module in &scope.modules {
+            scope_module.collect_types(container);
+        }
+    }
+
+    pub fn collect_types_to_pool(&self) -> HashMap<String, Type> {
+        let mut ans = HashMap::new();
+        self.collect_types(&mut ans);
+        ans
+    }
 }
 
 fn flatten_use_tree_rename_abort_warning(use_tree: &UseTree) {
@@ -395,7 +491,7 @@ fn flatten_use_tree_rename_abort_warning(use_tree: &UseTree) {
 ///
 /// Warning: As of writing, import renames (import a::b as c) are silently
 /// ignored.
-fn flatten_use_tree(use_tree: &UseTree) -> Vec<Vec<String>> {
+fn flatten_use_tree(use_tree: &UseTree) -> ParserResult<Vec<Vec<String>>> {
     // Vec<(path, is_complete)>
     let mut result = vec![(vec![], false)];
 
@@ -521,16 +617,16 @@ fn flatten_use_tree(use_tree: &UseTree) -> Vec<Vec<String>> {
                                 }
                             }
                             UseTree::Group(_) => {
-                                panic!(
+                                Err(anyhow::anyhow!(
                                     "Directly-nested use groups ({}) are not supported by flutter_rust_bridge. Use {} instead.",
                                     "use a::{{b}, c}",
                                     "a::{b, c}"
-                                );
+                                ))?;
                             }
                             // UseTree::Group(_) => panic!(),
                             UseTree::Rename(_) => {
                                 flatten_use_tree_rename_abort_warning(use_tree);
-                                return vec![];
+                                return Ok(vec![]);
                             }
                         }
 
@@ -539,7 +635,7 @@ fn flatten_use_tree(use_tree: &UseTree) -> Vec<Vec<String>> {
                 }
                 UseTree::Rename(_) => {
                     flatten_use_tree_rename_abort_warning(use_tree);
-                    return vec![];
+                    return Ok(vec![]);
                 }
             }
         }
@@ -549,5 +645,5 @@ fn flatten_use_tree(use_tree: &UseTree) -> Vec<Vec<String>> {
         }
     }
 
-    result.into_iter().map(|val| val.0).collect()
+    Ok(result.into_iter().map(|val| val.0).collect())
 }
